@@ -291,7 +291,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     peft_config=asdict(peft_config),
                     lora_tensors=updated_params,
                 )
-                self.inference_engine.llm_engine.add_lora(lora_reqest)
+                # For async mode (WorkerWrapperBase), use add_lora() directly
+                if hasattr(self.inference_engine, 'llm_engine'):
+                    self.inference_engine.llm_engine.add_lora(lora_reqest)
+                else:
+                    self.inference_engine.add_lora(lora_reqest)
                 logger.info(f"vLLM load weights, loaded_params: {len(updated_params)}")
                 return
             else:

@@ -46,6 +46,7 @@ from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
+from vllm.config import LoRAConfig
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.worker.worker_base import WorkerWrapperBase
@@ -415,6 +416,9 @@ class vLLMAsyncRollout:
         self.is_sleep = False
         self.address = self._init_zeromq()
 
+        # Add LoRA config
+        self.lora_kwargs = kwargs.pop("lora_kwargs", {})
+
     def _init_zeromq(self) -> str:
         tensor_parallel_size = self.config.tensor_model_parallel_size
 
@@ -462,11 +466,20 @@ class vLLMAsyncRollout:
         all_kwargs[0]["local_rank"] = 0
 
         self.vllm_config = all_kwargs[0]["vllm_config"]
+
+        if self.lora_kwargs:
+            lora_kwargs = {k: v for k, v in self.lora_kwargs.items() if k != "enable_lora"}
+            lora_config = LoRAConfig(**lora_kwargs)
+            model_config = self.vllm_config.model_config
+            lora_config.verify_with_model_config(model_config)
+            self.vllm_config.lora_config = lora_config
+
         self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        # If self.lora_kwargs is not empty, the lora kwargs are also passed to the init_worker
         self.inference_engine.init_worker(all_kwargs)
 
     def load_model(self, *args, **kwargs):
-        self.inference_engine.load_model(*args, **kwargs)
+        self.inference_engine.worker.load_model(*args, **kwargs)
 
         # inference engine is initialized now, update sharding manager
         self.sharding_manager.inference_engine = self.inference_engine
