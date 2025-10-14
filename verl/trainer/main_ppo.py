@@ -58,6 +58,7 @@ def run_ppo(config) -> None:
         ray.init(
             runtime_env=get_ppo_ray_runtime_env(),
             num_cpus=config.ray_init.num_cpus,
+            _temp_dir="/net/scratch2/listar2000/tmp/"
         )
 
     # Create a remote instance of the TaskRunner class, and

@@ -52,6 +52,34 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def replace_lora_wrapper(k, peft_config):
+    """Replace LoRA parameter keys with base layer equivalents.
+
+    Transforms LoRA parameter names to their corresponding base layer
+    names for proper weight loading in vLLM when base model sync is not done.
+
+    Args:
+        k (str): Original parameter key name.
+
+    Returns:
+        str: Transformed parameter key for base layer.
+    """
+    stacked_params = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    if k.endswith(".weight"):
+        module_k = k[: -len(".weight")]
+        if check_exclude_modules(peft_config, module_k):
+            return k
+        elif any([module_k.endswith(s) for s in stacked_params]) or check_target_modules(peft_config, module_k):
+            return f"{module_k}.base_layer.weight"
+    if k.endswith(".bias"):
+        module_k = k[: -len(".bias")]
+        if check_exclude_modules(peft_config, module_k):
+            return k
+        elif any([module_k.endswith(s) for s in stacked_params]) or check_target_modules(peft_config, module_k):
+            return f"{module_k}.base_layer.bias"
+    return k
+
+
 class FSDPVLLMShardingManager(BaseShardingManager):
     """Sharding manager for FSDP models with vLLM inference engine integration.
 
@@ -202,10 +230,22 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             if hasattr(peft_model, "peft_config"):
                 peft_config = peft_model.peft_config.get("default", None)
                 params = __collect_lora_params()
+                if not self.base_sync_done:
+                    params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
             else:
                 params = self.module.state_dict()
             params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
             log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
+
+            # fix: support per_tensor_param
+            if peft_config is not None and self.base_sync_done:
+                per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
+            else:
+                device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+                per_tensor_param = (
+                    (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                    for name, param in params.items()
+                )
 
             if self.rollout_config.free_cache_engine:
                 if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
@@ -214,9 +254,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     self.inference_engine.wake_up()
 
             # update model params
-            self.update_params(params, peft_config=peft_config)
+            self.update_params(per_tensor_param, peft_config=peft_config)
             log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
-            del params
+            del params, per_tensor_param
             if self.offload_param:
                 offload_fsdp_model_to_cpu(self.module)
             get_torch_device().empty_cache()
@@ -228,6 +268,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 self.inference_engine.wake_up(tags=["kv_cache"])
 
             log_gpu_memory_usage("After del state_dict and empty_cache in sharding manager", logger=logger)
+            self.base_sync_done = True
 
             # important: need to manually set the random states of each tp to be identical.
             if self.device_mesh is not None:
@@ -281,62 +322,27 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             peft_config (optional): PEFT configuration for LoRA adapters.
         """
         model = self.model_runner.model
-        if peft_config:
-            if self.base_sync_done:
-                lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
-                lora_reqest = TensorLoRARequest(
-                    lora_name=f"{lora_int_id}",
-                    lora_int_id=lora_int_id,
-                    lora_path="simon_lora_path",
-                    peft_config=asdict(peft_config),
-                    lora_tensors=updated_params,
-                )
-                self.inference_engine.llm_engine.add_lora(lora_reqest)
-                logger.info(f"vLLM load weights, loaded_params: {len(updated_params)}")
-                return
-            else:
+        if peft_config and self.base_sync_done:
+            from verl.utils.vllm_utils import TensorLoRARequest  # local import for clarity
 
-                def replace_lora_wrapper(k):
-                    """Replace LoRA parameter keys with base layer equivalents.
-
-                    Transforms LoRA parameter names to their corresponding base layer
-                    names for proper weight loading in vLLM when base model sync is not done.
-
-                    Args:
-                        k (str): Original parameter key name.
-
-                    Returns:
-                        str: Transformed parameter key for base layer.
-                    """
-                    stacked_params = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-                    if k.endswith(".weight"):
-                        module_k = k[: -len(".weight")]
-                        if check_exclude_modules(peft_config, module_k):
-                            return k
-                        elif any([module_k.endswith(s) for s in stacked_params]) or check_target_modules(
-                            peft_config, module_k
-                        ):
-                            return f"{module_k}.base_layer.weight"
-                    if k.endswith(".bias"):
-                        module_k = k[: -len(".bias")]
-                        if check_exclude_modules(peft_config, module_k):
-                            return k
-                        elif any([module_k.endswith(s) for s in stacked_params]) or check_target_modules(
-                            peft_config, module_k
-                        ):
-                            return f"{module_k}.base_layer.bias"
-                    return k
-
-                updated_params = {replace_lora_wrapper(k): v for k, v in updated_params.items()}
-
-        patch_vllm_moe_model_weight_loader(model)
-        device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-        loaded_params = model.load_weights(
-            (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                for name, param in updated_params.items()
+            lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
+            lora_request = TensorLoRARequest(
+                lora_name=f"{lora_int_id}",
+                lora_int_id=lora_int_id,
+                lora_path="simon_lora_path",
+                peft_config=asdict(peft_config),
+                lora_tensors=dict(updated_params),
             )
-        )
-
-        self.base_sync_done = True
-        logger.info(f"vLLM load weights, loaded_params: {len(loaded_params) if loaded_params else -1}")
+            # async mode (WorkerWrapperBase): prefer llm_engine if present
+            ie = self.inference_engine
+            if hasattr(ie, "llm_engine"):
+                ie.llm_engine.add_lora(lora_request)
+            else:
+                ie.add_lora(lora_request)
+            logger.info(f"vLLM load weights, loaded_params: {len(updated_params)}")
+            return
+        else:
+            patch_vllm_moe_model_weight_loader(model)
+            
+            loaded_params = model.load_weights(updated_params)
+            logger.info(f"vLLM load weights, loaded_params: {len(loaded_params) if loaded_params else -1}")

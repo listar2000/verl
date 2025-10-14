@@ -22,6 +22,7 @@ PPO_RAY_RUNTIME_ENV = {
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     },
+    "worker_process_setup_hook": "rllm.patches.verl_patch_hook.setup",
 }
 
 
@@ -34,4 +35,5 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    runtime_env["worker_process_setup_hook"] = PPO_RAY_RUNTIME_ENV["worker_process_setup_hook"]
     return runtime_env

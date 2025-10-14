@@ -32,6 +32,7 @@ from vllm.outputs import RequestOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
 from vllm.worker.worker_base import WorkerWrapperBase
+from vllm.lora.request import LoRARequest
 
 from verl.utils.fs import copy_to_local
 from verl.workers.rollout.async_server import AsyncServerBase
@@ -241,6 +242,13 @@ class AsyncvLLMServer(AsyncServerBase):
         else:
             distributed_executor_backend = None
 
+        self.lora_rank = self.config.model.get("lora_rank", 0)
+        lora_kwargs = {
+            "enable_lora": True,
+            "max_loras": 1,
+            "max_lora_rank": self.lora_rank
+        } if self.lora_rank > 0 else {}
+
         engine_args = AsyncEngineArgs(
             model=local_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -260,6 +268,7 @@ class AsyncvLLMServer(AsyncServerBase):
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            **lora_kwargs,
         )
 
         # init async llm engine
@@ -282,6 +291,10 @@ class AsyncvLLMServer(AsyncServerBase):
             tool_parser=config.multi_turn.format,  # hermes, llama3_json, ...
         )
 
+        if self.lora_rank > 0:
+            lora_request = LoRARequest(lora_name="123", lora_int_id=123, lora_path='simon_lora_path')
+            self.openai_serving_chat.models.lora_requests.append(lora_request)
+
     def _create_engine_config(self, engine_args: AsyncEngineArgs):
         vllm_config = engine_args.create_engine_config()
         namespace = ray.get_runtime_context().namespace
@@ -302,6 +315,10 @@ class AsyncvLLMServer(AsyncServerBase):
         API reference: https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html
         """
         request_json = await raw_request.json()
+        
+        if self.lora_rank > 0:
+            request_json["model"] = "123"
+
         request = ChatCompletionRequest(**request_json)
         generator = await self.openai_serving_chat.create_chat_completion(request, raw_request)
 
@@ -317,7 +334,9 @@ class AsyncvLLMServer(AsyncServerBase):
         max_tokens = self.max_model_len - len(prompt_ids)
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt = TokensPrompt(prompt_token_ids=prompt_ids)
-        generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
+
+        lora_request = LoRARequest(lora_name="123", lora_int_id=123, lora_path="simon_lora_path")
+        generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id, lora_request=lora_request)
 
         # Get final response
         final_res: Optional[RequestOutput] = None
